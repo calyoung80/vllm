@@ -1078,7 +1078,7 @@ class ModelConfig:
             return False
         elif self.hf_text_config.model_type in \
             ('deepseek_v2', 'deepseek_v3', 'deepseek_v32', 'deepseek_mtp',
-              'kimi_k2', 'longcat_flash'):
+              'kimi_k2', 'longcat_flash', 'pangu_ultra_moe', 'pangu_ultra_moe_mtp',):
             return self.hf_text_config.kv_lora_rank is not None
         elif self.hf_text_config.model_type == 'eagle':
             # if the model is an EAGLE module, check for the
@@ -1201,7 +1201,8 @@ class ModelConfig:
                 or self.hf_config.model_type == "mimo_mtp"
                 or self.hf_config.model_type == "glm4_moe_mtp"
                 or self.hf_config.model_type == "ernie_mtp"
-                or self.hf_config.model_type == "qwen3_next_mtp"):
+                or self.hf_config.model_type == "qwen3_next_mtp"
+                or self.hf_config.model_type == "pangu_ultra_moe_mtp"):
             total_num_hidden_layers = getattr(self.hf_text_config,
                                               "num_nextn_predict_layers", 0)
         elif (self.hf_config.model_type == "longcat_flash_mtp"):

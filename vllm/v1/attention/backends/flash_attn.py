@@ -13,6 +13,8 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               is_quantized_kv_cache)
 from vllm.attention.layer import Attention
 from vllm.attention.ops.merge_attn_states import merge_attn_states
+from vllm.attention.ops.triton_reshape_and_cache_flash import (
+    triton_reshape_and_cache_flash_diffkv)
 from vllm.attention.utils.fa_utils import (flash_attn_supports_fp8,
                                            get_flash_attn_version,
                                            is_flash_attn_varlen_func_available)
@@ -81,20 +83,29 @@ class FlashAttentionBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
         cache_dtype_str: str = "auto",
+        head_size_v: int | None = None,
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
+        if head_size_v is None or head_size == head_size_v:
+            return (2, num_blocks, block_size, num_kv_heads, head_size)
+        else:
+            return (
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                head_size + head_size_v,
+            )
 
     @staticmethod
-    def get_kv_cache_stride_order() -> tuple[int, ...]:
+    def get_kv_cache_stride_order(diff_kv: bool = False) -> tuple[int, ...]:
         # `stride_order` indicates the permutation that gets
         # us from `get_kv_cache_shape` to the actual memory layout we want.
         cache_layout = get_kv_cache_layout()
         if cache_layout == "NHD":
-            stride_order = (0, 1, 2, 3, 4)
+            stride_order = (0, 1, 2, 3, 4) if not diff_kv else (0, 1, 2, 3)
         elif cache_layout == "HND":
-            stride_order = (0, 1, 3, 2, 4)
+            stride_order = (0, 1, 3, 2, 4) if not diff_kv else (0, 2, 1, 3)
         else:
             raise ValueError(f"Unknown cache layout format {cache_layout}.")
         return stride_order
@@ -481,7 +492,13 @@ class FlashAttentionImpl(AttentionImpl):
                                                    attn_metadata, layer)
 
         # For decoder and cross-attention, use KV cache as before
-        key_cache, value_cache = kv_cache.unbind(0)
+        if self.head_size == kv_cache.shape[-1]:
+            # Same head_size for K and V
+            key_cache, value_cache = kv_cache.unbind(0)
+        else:
+            # Different head_size for K and V
+            key_cache = kv_cache[..., :self.head_size]
+            value_cache = kv_cache[..., self.head_size:]
 
         # key and value may be None in the case of cross attention. They are
         # calculated once based on the output from the encoder and then cached
@@ -495,16 +512,29 @@ class FlashAttentionImpl(AttentionImpl):
             # and value[:num_actual_tokens] because the reshape_and_cache_flash
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
-            reshape_and_cache_flash(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                attn_metadata.slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
-            )
+            if self.head_size == kv_cache.shape[-1]:
+                # kv_cache update for same head_size K and V
+                reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
+            else:
+                # kv_cache update for different head_size K and V
+                triton_reshape_and_cache_flash_diffkv(
+                    key,
+                    value,
+                    kv_cache,
+                    attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
 
         if self.kv_cache_dtype.startswith("fp8"):
             # queries are quantized in the attention layer

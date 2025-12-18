@@ -255,7 +255,12 @@ class EagleProposer:
             return draft_token_ids.view(-1, 1)
 
         positions = target_positions[last_token_indices]
-        if self.method in ("deepseek_mtp", "ernie_mtp", "longcat_flash_mtp"):
+        if self.method in (
+                "deepseek_mtp",
+                "ernie_mtp",
+                "longcat_flash_mtp",
+                "pangu_ultra_moe_mtp",
+        ):
             hidden_states = self.hidden_states[last_token_indices]
         else:
             hidden_states = hidden_states[last_token_indices]

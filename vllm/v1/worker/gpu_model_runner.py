@@ -82,6 +82,7 @@ from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec, KVCacheSpec,
                                         MambaSpec, MLAAttentionSpec,
+                                        SinkFullAttentionSpec,
                                         SlidingWindowSpec,
                                         UniformTypeKVCacheSpecs)
 # yapf: enable
@@ -232,6 +233,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             parallel_config)
         self.hidden_size = model_config.get_hidden_size()
         self.attention_chunk_size = model_config.attention_chunk_size
+        self.sink_len = getattr(self.vllm_config.model_config.hf_config,
+                                "param_sink_number", 0)
+        assert self.sink_len % self.cache_config.block_size == 0
         # Only relevant for models using ALiBi (e.g, MPT)
         self.use_alibi = check_use_alibi(model_config)
 
@@ -323,6 +327,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.is_pooling_model,
                 self.vllm_config.model_config.logits_processors),
             is_pooling_model=self.is_pooling_model,
+            sink_len=self.sink_len,
         )
 
         self.use_async_scheduling = self.scheduler_config.async_scheduling
@@ -3753,6 +3758,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_speculative_tokens=(
                     self.vllm_config.speculative_config.num_speculative_tokens
                     if self.vllm_config.speculative_config else 0),
+                sink_len=self.sink_len,
             )
 
     def _allocate_kv_cache_tensors(
@@ -3824,16 +3830,25 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                               kv_cache_spec.page_size_bytes)
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
+                    if (hasattr(kv_cache_spec, "head_size_v")
+                            and kv_cache_spec.head_size_v
+                            != kv_cache_spec.head_size):
+                        kwargs = {"head_size_v": kv_cache_spec.head_size_v}
+                        stride_kwargs = {"diff_kv": True}
+                    else:
+                        kwargs = {}
+                        stride_kwargs = {}
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         num_blocks,
                         kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
-                        cache_dtype_str=self.cache_config.cache_dtype)
+                        cache_dtype_str=self.cache_config.cache_dtype,
+                        **kwargs)
                     dtype = kv_cache_spec.dtype
                     try:
                         kv_cache_stride_order = \
-                            attn_backend.get_kv_cache_stride_order()
+                            attn_backend.get_kv_cache_stride_order(**stride_kwargs)
                         assert len(kv_cache_stride_order) == len(
                             kv_cache_shape)
                     except (AttributeError, NotImplementedError):
@@ -4089,11 +4104,20 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         head_size=attn_module.head_size,
                         dtype=self.kv_cache_dtype,
                         attention_chunk_size=self.attention_chunk_size)
+                elif self.sink_len > 0:
+                    kv_cache_spec[layer_name] = SinkFullAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=attn_module.num_kv_heads,
+                        head_size=attn_module.head_size,
+                        head_size_v=attn_module.head_size_v,
+                        sink_len=self.sink_len,
+                        dtype=self.kv_cache_dtype)
                 else:
                     kv_cache_spec[layer_name] = FullAttentionSpec(
                         block_size=block_size,
                         num_kv_heads=attn_module.num_kv_heads,
                         head_size=attn_module.head_size,
+                        head_size_v=attn_module.head_size_v,
                         dtype=self.kv_cache_dtype)
             elif attn_module.attn_type == AttentionType.ENCODER_DECODER:
                 kv_cache_spec[layer_name] = CrossAttentionSpec(

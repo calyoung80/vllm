@@ -23,6 +23,7 @@ class BlockTable:
         max_num_batched_tokens: int,
         pin_memory: bool,
         device: torch.device,
+        sink_len: int = 0,
     ):
         self.block_size = block_size
         self.max_num_reqs = max_num_reqs
@@ -30,9 +31,11 @@ class BlockTable:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.pin_memory = pin_memory
         self.device = device
+        self.sink_block_len = sink_len // self.block_size
+        self.max_num_blocks_per_req = self.max_num_blocks_per_req + self.sink_block_len
 
         self.block_table = self._make_buffer(max_num_reqs,
-                                             max_num_blocks_per_req,
+                                             self.max_num_blocks_per_req,
                                              dtype=torch.int32)
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
 
@@ -89,8 +92,9 @@ class BlockTable:
             # Use a "virtual block" which equals to world_size * block_size
             # for block_table_indices calculation.
             virtual_block_size = self.block_size * self.dcp_world_size
-            block_table_indices = (req_indices * self.max_num_blocks_per_req +
-                                   positions // virtual_block_size)
+            block_table_indices = (
+                req_indices * self.max_num_blocks_per_req +
+                positions // virtual_block_size) + self.sink_block_len
             block_numbers = self.block_table.np.ravel()[block_table_indices]
             # Use virtual_block_size for mask calculation, which marks local
             # tokens.
@@ -104,8 +108,9 @@ class BlockTable:
             self.slot_mapping.np[:req_indices.shape[0]] = np.where(
                 mask, slot_mapping, -1)
         else:
-            block_table_indices = (req_indices * self.max_num_blocks_per_req +
-                                   positions // self.block_size)
+            block_table_indices = (
+                req_indices * self.max_num_blocks_per_req +
+                positions // self.block_size) + self.sink_block_len
             block_numbers = self.block_table.np.ravel()[block_table_indices]
             block_offsets = positions % self.block_size
             np.add(block_numbers * self.block_size,
@@ -145,14 +150,17 @@ class BlockTable:
 class MultiGroupBlockTable:
     """The BlockTables for each KV cache group."""
 
-    def __init__(self,
-                 max_num_reqs: int,
-                 max_model_len: int,
-                 max_num_batched_tokens: int,
-                 pin_memory: bool,
-                 device: torch.device,
-                 block_sizes: list[int],
-                 num_speculative_tokens: int = 0) -> None:
+    def __init__(
+        self,
+        max_num_reqs: int,
+        max_model_len: int,
+        max_num_batched_tokens: int,
+        pin_memory: bool,
+        device: torch.device,
+        block_sizes: list[int],
+        num_speculative_tokens: int = 0,
+        sink_len: int = 0,
+    ) -> None:
         # Note(hc): each dcp rank only store
         # (max_model_len//dcp_world_size) tokens in kvcache,
         # so the block_size which used for calc max_num_blocks_per_req
@@ -165,10 +173,15 @@ class MultiGroupBlockTable:
 
         self.block_tables = [
             BlockTable(
-                block_size, max_num_reqs,
+                block_size,
+                max_num_reqs,
                 max(cdiv(max_model_len, block_size * dcp_world_size),
-                    1 + num_speculative_tokens), max_num_batched_tokens,
-                pin_memory, device) for block_size in block_sizes
+                    1 + num_speculative_tokens),
+                max_num_batched_tokens,
+                pin_memory,
+                device,
+                sink_len=sink_len,
+            ) for block_size in block_sizes
         ]
 
     def append_row(self, block_ids: tuple[list[int], ...],
