@@ -4,6 +4,7 @@
 from typing import Optional
 
 import torch
+import torch_npu
 
 from vllm.model_executor.custom_op import CustomOp
 
@@ -84,18 +85,30 @@ class RotaryEmbedding(CustomOp):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: Optional[torch.Tensor] = None,
+        offsets: Optional[torch.Tensor] = None,
+        output_cos_sin: Optional[bool] = False,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """A PyTorch-native implementation of forward()."""
+        if offsets is not None:
+            positions = positions + offsets
         positions = positions.flatten()
         num_tokens = positions.shape[0]
         cos_sin = self.cos_sin_cache.index_select(0, positions)
         cos, sin = cos_sin.chunk(2, dim=-1)
+        # patch for kvrmsnormropecache which need cos and sin
+        if output_cos_sin:
+            cos_cache = torch.cat((cos, cos), dim=1)
+            sin_cache = torch.cat((sin, sin), dim=1)
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
         query_rot = query[..., :self.rotary_dim]
         query_pass = query[..., self.rotary_dim:]
-        query_rot = apply_rotary_emb_torch(query_rot, cos, sin,
+        # patch for q use npu_interleave_rope
+        if output_cos_sin:
+            query_rot = torch_npu.npu_interleave_rope(query_rot.unsqueeze(2), cos_cache.unsqueeze(1).unsqueeze(1), sin_cache.unsqueeze(1).unsqueeze(1)).squeeze(2)
+        else:
+            query_rot = apply_rotary_emb_torch(query_rot, cos, sin,
                                            self.is_neox_style)
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
@@ -105,10 +118,16 @@ class RotaryEmbedding(CustomOp):
             key = key.view(num_tokens, -1, self.head_size)
             key_rot = key[..., :self.rotary_dim]
             key_pass = key[..., self.rotary_dim:]
-            key_rot = apply_rotary_emb_torch(key_rot, cos, sin,
+            if output_cos_sin:
+                key_rot = torch_npu.npu_interleave_rope(key_rot.unsqueeze(2), cos_cache.unsqueeze(1).unsqueeze(1), sin_cache.unsqueeze(1).unsqueeze(1)).squeeze(2)
+            else:
+                key_rot = apply_rotary_emb_torch(key_rot, cos, sin,
                                              self.is_neox_style)
             key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
-        return query, key
+        if output_cos_sin:
+            return query, key, cos_cache, sin_cache
+        else:
+            return query, key, None, None
 
     def forward_cuda(
         self,

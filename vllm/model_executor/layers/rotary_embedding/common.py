@@ -41,7 +41,8 @@ def apply_rotary_emb_torch(
         x2 = x[..., 1::2]
     o1 = x1 * cos - x2 * sin
     o2 = x2 * cos + x1 * sin
-    if is_neox_style:
+    #if is_neox_style:
+    if  True:
         return torch.cat((o1, o2), dim=-1)
     else:
         return torch.stack((o1, o2), dim=-1).flatten(-2)

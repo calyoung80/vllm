@@ -32,10 +32,10 @@ logger = init_logger(__name__)
 SpeculativeMethod = Literal["ngram", "eagle", "eagle3", "medusa",
                             "mlp_speculator", "draft_model", "deepseek_mtp",
                             "ernie_mtp", "qwen3_next_mtp", "mimo_mtp",
-                            "longcat_flash_mtp", "pangu_ultra_moe_mtp", "mtp"]
+                            "longcat_flash_mtp", "pangu_ultra_moe_mtp", "pangu_pro_moe_mtp", "mtp"]
 MTP_MODEL_TYPES = ("deepseek_mtp", "mimo_mtp", "glm4_moe_mtp", "ernie_mtp",
                    "qwen3_next_mtp", "longcat_flash_mtp",
-                   "pangu_ultra_moe_mtp")
+                   "pangu_ultra_moe_mtp","pangu_pro_moe_mtp")
 
 
 @config
@@ -206,7 +206,21 @@ class SpeculativeConfig:
                 "n_predict": n_predict,
                 "architectures": ["OpenPanguMTPModel"]
             })
+        
+        if hf_config.model_type in ("PanguProMoE"):
+            hf_config.model_type = "pangu_pro_moe_mtp"
+        if hf_config.model_type == "pangu_pro_moe_mtp":
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update({
+                "n_predict": n_predict,
+                "architectures": ["OpenPanguMTPModel"]
+            })
 
+        #hyj
+        # if hf_config.model_type in ("PanguProMoE"):
+        #     hf_config.model_type = "deepseek_mtp"
+        #     n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+        #     hf_config.update({"n_predict": n_predict, "architectures": ["OpenPanguMTPModel"]})
         return hf_config
 
     def __post_init__(self):

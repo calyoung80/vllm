@@ -83,6 +83,12 @@ _RUNNER_CONVERTS: dict[RunnerType, list[ConvertType]] = {
     "draft": [],
 }
 
+def get_attr_by_names(src_config, attrs, default_value):
+    for attr in attrs:
+        value = getattr(src_config, attr, 0)
+        if value > 0:
+            return value
+    return default_value
 
 @config
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
@@ -1086,6 +1092,17 @@ class ModelConfig:
             return self.hf_text_config.model.model_type in \
                     ('deepseek_v2', 'deepseek_v3', 'deepseek_v32') \
                 and self.hf_text_config.kv_lora_rank is not None
+        return False
+
+    # this is a new function for pangu 72Bv2: v head dim is different from q and k
+    @property
+    def is_different_dim(self) -> int:
+        v_dim_names = ['v_channels', 'v_head_dim']
+        v_head_dim = get_attr_by_names(self.hf_text_config, v_dim_names, None)
+        if not hasattr(self.hf_text_config, "model_type"):
+            return False
+        elif self.hf_text_config.model_type in ('PanguProMoE'):
+            return v_head_dim is not None
         return False
 
     def get_head_size(self) -> int:
