@@ -56,7 +56,7 @@ class PanguToolParser(ToolParser):
 
     def _get_next_call_id(self):
         """Generate unique call ID"""
-        return f'call_{uuid.uuid4().hex[:24]}'    
+        return f'call_{uuid.uuid4().hex[:24]}'
    
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
         """
@@ -179,6 +179,8 @@ class PanguToolParser(ToolParser):
                 # streamed to the client yet.
                 delta = self.start_new_tool(tool_call_arr, current_tool_call)
                 return delta
+            # case: update an existing tool - this is handled below
+
             # if the current tool name hasn't been sent, send if available
             # - otherwise send nothing
             elif not self.current_tool_name_sent:

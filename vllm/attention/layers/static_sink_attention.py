@@ -61,7 +61,7 @@ def create_static_sink_attention_backend(
             fast_build: bool = False,
             model: Optional[nn.Module] = None,
         ) -> AttentionMetadata:
-            common_attn_metadata.seq_lens = common_attn_metadata.seq_lens + self.sink_len        
+            common_attn_metadata.seq_lens = common_attn_metadata.seq_lens + self.sink_len
             common_attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens_cpu + self.sink_len
             
             common_attn_metadata.block_table_tensor = F.pad(common_attn_metadata.block_table_tensor, (1, 0, 0, 0), value=0)
@@ -213,6 +213,6 @@ def maybe_populate_sink_fake(
 direct_register_custom_op(
     op_name="maybe_populate_sink",
     op_func=maybe_populate_sink,
-    mutates_args=["self_k_cache","self_v_cache"],
+    mutates_args=["self_k_cache", "self_v_cache"],
     fake_impl=maybe_populate_sink_fake,
 )

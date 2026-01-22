@@ -121,7 +121,7 @@ class RotaryEmbedding(CustomOp):
             key_pass = key[..., self.rotary_dim:]
             # patch for k use npu_interleave_rope
             if output_cos_sin:
-                key_rot = torch_npu.npu_interleave_rope(key_rot.unsqueeze(2), cos_cache.unsqueeze(1).unsqueeze(1),  \
+                key_rot = torch_npu.npu_interleave_rope(key_rot.unsqueeze(2), cos_cache.unsqueeze(1).unsqueeze(1), \
                     sin_cache.unsqueeze(1).unsqueeze(1)).squeeze(2)
             else:
                 key_rot = apply_rotary_emb_torch(key_rot, cos, sin,
