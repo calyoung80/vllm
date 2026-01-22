@@ -64,6 +64,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 from vllm.platforms import current_platform
 from vllm.logger import init_logger
+logger = init_logger(__name__)
 
 import inspect
 PANGU_DEBUG = False
@@ -84,7 +85,7 @@ def debug_data(data, prefix=None, rank=0):
     local_rank = torch.distributed.get_rank()
     if rank == -1 or rank == local_rank:
         frame = inspect.stack()[1]
-        data_name = frame.code_context[0].split('(')[1].split(')')[0]
+        data_name = frame.code_context[0].split('(')[1].split(',')[0]
         print(f"rank:{local_rank} file:{frame.filename} line:{frame.lineno} prefix:{prefix} {data_name} {suffix}", flush=True)
 
 def rearrange_rope_channel(weight):
@@ -250,11 +251,11 @@ class OpenPanguMoE(nn.Module):
         if self.shared_experts is None:
             assert shared_output is None
 
-        #if hidden_states.dtype != torch.float16:
-        #    final_hidden_states *= self.routed_scaling_factor
-        #elif self.shared_experts is not None:
-        #    assert shared_output is not None
-        #    shared_output *= 1.0 / self.routed_scaling_factor
+        # if hidden_states.dtype != torch.float16:
+        #     final_hidden_states *= self.routed_scaling_factor
+        # elif self.shared_experts is not None:
+        #     assert shared_output is not None
+        #     shared_output *= 1.0 / self.routed_scaling_factor
 
         if self.shared_experts is not None:
             assert shared_output is not None
@@ -620,6 +621,8 @@ class OpenPanguSinkAttention(nn.Module):
         self.param_sink_scalar = getattr(config, "param_sink_scalar", None)
         self.param_sink_of_head_num = getattr(config, "param_sink_of_head_dim",
                                               False)
+        self.enable_kv_rmsnorm_rope_cache = getattr(config, "enable_kv_rmsnorm_rope_cache",
+                                              False)
 
         self.qkv_proj = MergedColumnParallelLinear(
             input_size=hidden_size,
@@ -774,17 +777,23 @@ class OpenPanguSinkAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
-        k = self.k_layernorm(k.view(-1, self.num_kv_heads, self.head_dim))
-        q, k = self.rotary_emb(positions, q, k)
-
-        q = q.view(-1, self.q_size)
-        k = k.view(-1, self.k_size)
+        if self.enable_kv_rmsnorm_rope_cache:
+            q, _, cos, sin = self.rotary_emb(positions, q.contigous(), None, output_cos_sin = True)
+        else:
+            k = self.k_layernorm(k.view(-1, self.num_kv_heads, self.head_dim))
+            rope_res = self.rotary_emb(positions, q.contiguous(), k)
+            q, k = self.rotary_emb(positions, q, k)
+            cos, sin = None, None
 
         attn_output = self.attn(
             q,
             k,
             v,
-            output_shape=([q.shape[0], q.shape[1] // self.head_dim * self.v_channels]),
+            **(dict(k_norm_weight=self.k_layernorm.weight,
+                    k_norm_eps = self.k_layernorm.variance_epsilon,
+                    cos = cos,
+                    sin=sin) if self.enable_kv_rmsnorm_rope_cache else {}),
+            output_shape=(q.shape[0], q.shape[1] // self.head_dim * self.v_channels),
         )
         debug_data(attn_output, f"attn_output o_proj input")
         output, _ = self.o_proj(attn_output)
@@ -811,10 +820,11 @@ class OpenPanguSinkAttention(nn.Module):
         if hasattr(self, "k_layernorm") and self.k_layernorm is not None:
             param_sink_key = self.k_layernorm(self.param_sink_key)
             self.attn.impl.sink_key = rearrange_rope_channel(param_sink_key)
+            # self.attn.impl.sink_key = param_sink_key
         #else:
         #    param_sink_key = self.param_sink_key
-
-        #self.attn.update_sink_kv(param_sink_key, self.param_sink_value)
+        # self.attn.impl.sink_key = param_sink_key
+        # self.attn.update_sink_kv(param_sink_key, self.param_sink_value)
 
 
 class OpenPanguDecoderLayer(nn.Module):
@@ -969,7 +979,7 @@ class OpenPanguDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
-        debug_data(hidden_states, f"layer{self.layer_idx+1} input ")
+        debug_data(hidden_states, f"layer{self.layer_idx+1} input")
         if residual is None:
             residual = hidden_states.clone()
             hidden_states = self.input_layernorm(hidden_states)
@@ -977,7 +987,7 @@ class OpenPanguDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
         
-        debug_data(hidden_states, f"layer{self.layer_idx+1} attn input ")
+        debug_data(hidden_states, f"layer{self.layer_idx+1} attn input")
 
 
         hidden_states = self.self_attn(
@@ -985,7 +995,7 @@ class OpenPanguDecoderLayer(nn.Module):
             hidden_states=hidden_states,
         )
 
-        debug_data(hidden_states, f"layer{self.layer_idx+1} attn output ")
+        debug_data(hidden_states, f"layer{self.layer_idx+1} attn output")
 
         # if (self.routed_scaling_factor is not None
         #         and hidden_states.dtype == torch.float16):
@@ -998,7 +1008,7 @@ class OpenPanguDecoderLayer(nn.Module):
         #         # first layer.
         #         residual *= 1.0 / self.routed_scaling_factor
 
-        debug_data(hidden_states, f"layer{self.layer_idx+1} post_attention_layernorm input ")
+        debug_data(hidden_states, f"layer{self.layer_idx+1} post_attention_layernorm input")
 
         if self.sandwich_norm:
             hidden_states = self.post_attention_layernorm(hidden_states)

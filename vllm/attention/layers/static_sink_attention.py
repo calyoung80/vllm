@@ -4,6 +4,9 @@ import functools
 
 import torch
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from vllm.attention.backends.abstract import (AttentionBackend,
                                               AttentionMetadata, AttentionType)
 from vllm.attention.layer import Attention
@@ -18,6 +21,9 @@ from vllm.v1.attention.backends.utils import (CommonAttentionMetadata,
                                               subclass_attention_backend)
 from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheSpec,
                                         SinkFullAttentionSpec)
+from vllm.platforms import current_platform
+import torch_npu
+from typing import Optional
 
 logger = init_logger(__name__)
 
@@ -55,19 +61,10 @@ def create_static_sink_attention_backend(
             common_attn_metadata: CommonAttentionMetadata,
             fast_build: bool = False,
         ) -> AttentionMetadata:
-            common_attn_metadata.seq_lens[:] = (common_attn_metadata.seq_lens +
-                                                self.sink_len)
-            common_attn_metadata.seq_lens[common_attn_metadata.seq_lens ==
-                                          self.sink_len] = 0
-            common_attn_metadata.seq_lens_cpu[:] = (
-                common_attn_metadata.seq_lens_cpu + self.sink_len)
-            common_attn_metadata.seq_lens_cpu[common_attn_metadata.seq_lens_cpu
-                                              == self.sink_len] = 0
-            common_attn_metadata.max_seq_len = (
-                common_attn_metadata.max_seq_len + self.sink_len)
-            # print(f'blk_table_tensor: {common_attn_metadata.block_table_tensor[:, :16]}')
-            # print(f'slot_mapping: {common_attn_metadata.slot_mapping}')
-            # print(f'seq_lens: {common_attn_metadata.seq_lens}')
+            common_attn_metadata.seq_lens = common_attn_metadata.seq_lens + self.sink_len        
+            common_attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens_cpu + self.sink_len
+            
+            common_attn_metadata.block_table_tensor = F.pad(common_attn_metadata.block_table_tensor, (1,0,0,0), value=0)
 
             return super().build(common_prefix_len, common_attn_metadata,
                                  fast_build)
@@ -94,6 +91,9 @@ class StaticSinkAttention(Attention):
         sink_len: int,
         attn_backend: type[AttentionBackend] | None = None,
         cache_config: CacheConfig | None = None,
+        head_size_v: int | None = None,
+        sink_key: Optional[torch.Tensor] = None,
+        sink_value: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         dtype = torch.get_default_dtype()
@@ -121,16 +121,15 @@ class StaticSinkAttention(Attention):
             scale=scale,
             cache_config=cache_config,
             attn_backend=attn_backend,
+            head_size_v=head_size_v,
+            sink_key=sink_key,
+            sink_value=sink_value,
             **kwargs,
         )
 
         self.sink_len = sink_len
         self.block_size = block_size
         self.sink_populated = False
-        self.sink_key = None
-        self.sink_value = None
-
-    def update_sink_kv(self, sink_key, sink_value) -> None:
         self.sink_key = sink_key
         self.sink_value = sink_value
 
@@ -140,33 +139,39 @@ class StaticSinkAttention(Attention):
         key: torch.Tensor,
         value: torch.Tensor,
         output_shape: torch.Size | None = None,
+        k_norm_weight: Optional[torch.Tensor] = None,
+        k_norm_eps: Optional[float] = None,
+        cos: Optional[torch.Tensor] = None,
+        sin: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert self.sink_key is not None and self.sink_value is not None, (
             "sink_key and sink_value have not been prepared")
         if not self.sink_populated:
             forward_context: ForwardContext = get_forward_context()
             self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-            torch.ops.vllm.maybe_populate_sink(self_kv_cache, self.layer_name)
+            if self_kv_cache is not None and len(self_kv_cache) > 0:
+                torch.ops.vllm.maybe_populate_sink(self_kv_cache[0], self_kv_cache[1], self.layer_name)
 
-        return super().forward(query, key, value, output_shape)
+        return super().forward(query, key, value, output_shape, k_norm_weight, k_norm_eps, cos, sin)
 
     def populate_sink_kv(self, self_kv_cache):
         sink_kv_slot_mapping = torch.arange(
-            self.block_size,
-            self.sink_len + self.block_size,
-            device=torch.cuda.current_device(),
+            0,
+            self.sink_len,
+            device=current_platform.current_device(),
             dtype=torch.long,
-        )
-        triton_reshape_and_cache_flash_diffkv(
-            self.sink_key,
-            self.sink_value,
-            self_kv_cache,
-            sink_kv_slot_mapping,
-            self.kv_cache_dtype,
-            self._k_scale,
-            self._v_scale,
-        )
-        # We only populate the sink_key and sink_value once
+        ).unsqueeze(dim=1)
+        # triton_reshape_and_cache_flash_diffkv(
+        #     self.sink_key,
+        #     self.sink_value,
+        #     self_kv_cache,
+        #     sink_kv_slot_mapping,
+        #     self.kv_cache_dtype,
+        #     self._k_scale,
+        #     self._v_scale,
+        # )
+        # torch_npu.npu_scatter_nd_update_(self_kv_cache.view(-1, self_kv_cache.shape[-1]), sink_kv_slot_mapping, self.impl.sink_key.squeeze(dim=1))
+        # torch_npu.npu_scatter_nd_update_(self_kv_cache.view(-1, self_kv_cache.shape[-1]), sink_kv_slot_mapping, self.impl.sink_value.squeeze(dim=1))
         self.sink_populated = True
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
@@ -186,18 +191,20 @@ class StaticSinkAttention(Attention):
 
 
 def maybe_populate_sink(
-    self_kv_cache: torch.Tensor,
+    self_k_cache: torch.Tensor,
+    self_v_cache: torch.Tensor,
     layer_name: str,
 ) -> None:
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
-    if self.sink_populated or self_kv_cache.numel() == 0:
+    if self.sink_populated or self_k_cache.numel() == 0:
         return
-    self.populate_sink_kv(self_kv_cache)
+    self.populate_sink_kv(self_k_cache, self_v_cache)
 
 
 def maybe_populate_sink_fake(
-    self_kv_cache: torch.Tensor,
+    self_k_cache: torch.Tensor,
+    self_v_cache: torch.Tensor,
     layer_name: str,
 ) -> None:
     return
@@ -206,6 +213,6 @@ def maybe_populate_sink_fake(
 direct_register_custom_op(
     op_name="maybe_populate_sink",
     op_func=maybe_populate_sink,
-    mutates_args=["self_kv_cache"],
+    mutates_args=["self_k_cache","self_v_cache"],
     fake_impl=maybe_populate_sink_fake,
 )

@@ -1096,7 +1096,7 @@ class ModelConfig:
 
     # this is a new function for pangu 72Bv2: v head dim is different from q and k
     @property
-    def is_different_dim(self) -> int:
+    def is_different_kvdim(self) -> int:
         v_dim_names = ['v_channels', 'v_head_dim']
         v_head_dim = get_attr_by_names(self.hf_text_config, v_dim_names, None)
         if not hasattr(self.hf_text_config, "model_type"):

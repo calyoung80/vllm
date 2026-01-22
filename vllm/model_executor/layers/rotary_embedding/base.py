@@ -106,7 +106,8 @@ class RotaryEmbedding(CustomOp):
         query_pass = query[..., self.rotary_dim:]
         # patch for q use npu_interleave_rope
         if output_cos_sin:
-            query_rot = torch_npu.npu_interleave_rope(query_rot.unsqueeze(2), cos_cache.unsqueeze(1).unsqueeze(1), sin_cache.unsqueeze(1).unsqueeze(1)).squeeze(2)
+            query_rot = torch_npu.npu_interleave_rope(query_rot.unsqueeze(2), cos_cache.unsqueeze(1).unsqueeze(1), 
+                sin_cache.unsqueeze(1).unsqueeze(1)).squeeze(2)
         else:
             query_rot = apply_rotary_emb_torch(query_rot, cos, sin,
                                            self.is_neox_style)
@@ -118,8 +119,10 @@ class RotaryEmbedding(CustomOp):
             key = key.view(num_tokens, -1, self.head_size)
             key_rot = key[..., :self.rotary_dim]
             key_pass = key[..., self.rotary_dim:]
+            # patch for k use npu_interleave_rope
             if output_cos_sin:
-                key_rot = torch_npu.npu_interleave_rope(key_rot.unsqueeze(2), cos_cache.unsqueeze(1).unsqueeze(1), sin_cache.unsqueeze(1).unsqueeze(1)).squeeze(2)
+                key_rot = torch_npu.npu_interleave_rope(key_rot.unsqueeze(2), cos_cache.unsqueeze(1).unsqueeze(1), 
+                    sin_cache.unsqueeze(1).unsqueeze(1)).squeeze(2)
             else:
                 key_rot = apply_rotary_emb_torch(key_rot, cos, sin,
                                              self.is_neox_style)

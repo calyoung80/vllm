@@ -314,4 +314,4 @@ class PanguToolParser(ToolParser):
                 )
                 self.streamed_args_for_tool[self.current_tool_id] += argument_diff
 
-            return delta        
+        return delta        

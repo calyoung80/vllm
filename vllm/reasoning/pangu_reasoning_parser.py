@@ -28,7 +28,6 @@ class PanguReasoningParser(ReasoningParser):
 
     def __init__(self, tokenizer: PreTrainedTokenizerBase):
         super().__init__(tokenizer)
-        self.delta_token_ids = []
 
         if not self.model_tokenizer:
             raise ValueError("The model tokenizer must be passed to the ReasoningParser" "constructor during construction.")
@@ -36,14 +35,21 @@ class PanguReasoningParser(ReasoningParser):
         self.start_token_id = self.vocab.get(self.start_token)
         self.end_token_id = self.vocab.get(self.end_token)
         if self.start_token_id is None or self.end_token_id is None:
-            raise RuntimeError("Pangu Reasoning parser could not locate think start/end" "tokens in the tokenizer!")
+            raise RuntimeError("Pangu reasoning parser could not locate think start/end" "tokens in the tokenizer!")
 
     def is_reasoning_end(self, input_ids: list[int]) -> bool:
-        return (
-            self.end_token_id in input_ids and self.end_token_id in self.delta_token_ids
-        )
+        return self.end_token_id in input_ids and self.end_token_id in self.delta_token_ids
+    
+    def extract_content_ids(self, input_ids: list[int]) -> list[int]:
+        """
+        Extract the content after the end tokens
+        """
+        if self.end_token_id not in input_ids[:-1]:
+            return []
+        else:
+            return input_ids[input_ids.index(self.end_token_id) + 1 :]
 
-    def extract_reasoning_streaming(
+    def extract_reasoning_content_streaming(
         self,
         previous_text: str,
         current_text: str,
@@ -56,8 +62,8 @@ class PanguReasoningParser(ReasoningParser):
         Extract reasoning content from a delta message.
         Handles streaming output where previous + delta = current.
         Uses token IDs for faster processing.
-        for text [unused16]abc[unused17]xyz:
-        - 'abc' goes to the reasoning_content
+        For text [unused16]abc[unused17]xyz:
+        - 'abc' goes to reasoning_content
         - 'xyz' goes to content
         """
         self.delta_token_ids = delta_token_ids
@@ -70,16 +76,16 @@ class PanguReasoningParser(ReasoningParser):
         # keep compatibility with models that don't generate [unused16] tokens.
         if self.start_token_id in previous_token_ids:
             if self.end_token_id in delta_token_ids:
-                # extract reasoing context
+                # extract reasoing content
                 end_index = delta_text.find(self.end_token)
                 reasoning_content = delta_text[:end_index]
                 content = delta_text[end_index + len(self.end_token) :]
                 return DeltaMessage(reasoning_content=reasoning_content,content = content if content else None)
             elif self.end_token_id in previous_token_ids:
-                # reasoing content continues
+                # reasoning content continues
                 return DeltaMessage(content=delta_text)
             else:
-                # reasoing content continues
+                # reasoning content continues
                 return DeltaMessage(reasoning_content=delta_text)
         elif self.start_token_id in delta_token_ids:
             if self.end_token_id in delta_token_ids:
@@ -119,13 +125,13 @@ class PanguReasoningParser(ReasoningParser):
         Extract reasoning content from the model output.
         
         For text [unused16]abc[unused17]xyz:
-        - 'abc' goes to the reasoning_content
+        - 'abc' goes to reasoning_content
         - 'xyz' goes to content
         Returns :
             tuple[Optional[str], Optional[str]]: reasoning content and content
         """
 
-        # check if the start token is present in the model output, remove it
+        # Check if the start token is present in the model output, remove it
         # if it is present.
         model_output_parts = model_output.partition(self.start_token)
         model_output = model_output_parts[2] if model_output_parts[1] else model_output_parts[0]
@@ -137,7 +143,7 @@ class PanguReasoningParser(ReasoningParser):
             reasoning_content, _, content = model_output.partition(self.end_token)
             # If the end token is not found, return the model output as is.
             # It should not happen since we already checked for the presence
-            # of the end token
+            # of the end token.
             # If generation stops right after end-of-think, return null content
             final_content = content or None
             return reasoning_content, final_content
