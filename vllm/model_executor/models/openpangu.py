@@ -778,11 +778,11 @@ class OpenPanguSinkAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
         if self.enable_kv_rmsnorm_rope_cache:
-            q, _, cos, sin = self.rotary_emb(positions, q.contigous(), None, output_cos_sin = True)
+            q, _, cos, sin = self.rotary_emb(positions, q.contiguous(), None, output_cos_sin = True)
         else:
             k = self.k_layernorm(k.view(-1, self.num_kv_heads, self.head_dim))
             rope_res = self.rotary_emb(positions, q.contiguous(), k)
-            q, k = self.rotary_emb(positions, q, k)
+            q, k = rope_res[0], rope_res[1]
             cos, sin = None, None
 
         attn_output = self.attn(

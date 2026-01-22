@@ -193,14 +193,11 @@ class PanguToolParser(ToolParser):
 
         except Exception:
             logger.exception("Error trying to handle streaming tool call.")
-            logger.debug(
-                "Skipping chunk as a result of tool streaming extraction "
-                "error")
+            logger.debug("Skipping chunk as a result of tool streaming extraction " "error")
             return None
         
     def get_flags(self):
-        return Allow.ALL if self.current_tool_name_sent \
-            else Allow.ALL & ~Allow.STR
+        return Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
     
     def start_new_tool(self, tool_call_arr, current_tool_call):
         if self.current_tool_id >= 0:
@@ -299,8 +296,7 @@ class PanguToolParser(ToolParser):
                 prev_args_json = json.dumps(prev_arguments, ensure_ascii=False)
                 if cur_args_json != prev_args_json:
 
-                    prefix = find_common_prefix(
-                        prev_args_json, cur_args_json)
+                    prefix = find_common_prefix(prev_args_json, cur_args_json)
                     argument_diff = prefix[sent:]
 
             if argument_diff is not None:
@@ -314,4 +310,4 @@ class PanguToolParser(ToolParser):
                 )
                 self.streamed_args_for_tool[self.current_tool_id] += argument_diff
 
-        return delta        
+        return delta

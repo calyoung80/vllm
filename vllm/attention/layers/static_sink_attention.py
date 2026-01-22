@@ -4,7 +4,6 @@ import functools
 
 import torch
 
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.attention.backends.abstract import (AttentionBackend,
@@ -60,11 +59,12 @@ def create_static_sink_attention_backend(
             common_prefix_len: int,
             common_attn_metadata: CommonAttentionMetadata,
             fast_build: bool = False,
+            model: Optional[nn.Module] = None,
         ) -> AttentionMetadata:
             common_attn_metadata.seq_lens = common_attn_metadata.seq_lens + self.sink_len        
             common_attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens_cpu + self.sink_len
             
-            common_attn_metadata.block_table_tensor = F.pad(common_attn_metadata.block_table_tensor, (1,0,0,0), value=0)
+            common_attn_metadata.block_table_tensor = F.pad(common_attn_metadata.block_table_tensor, (1, 0, 0, 0), value=0)
 
             return super().build(common_prefix_len, common_attn_metadata,
                                  fast_build)
@@ -154,7 +154,7 @@ class StaticSinkAttention(Attention):
 
         return super().forward(query, key, value, output_shape, k_norm_weight, k_norm_eps, cos, sin)
 
-    def populate_sink_kv(self, self_kv_cache):
+    def populate_sink_kv(self, self_k_cache, self_v_cache):
         sink_kv_slot_mapping = torch.arange(
             0,
             self.sink_len,
@@ -170,8 +170,8 @@ class StaticSinkAttention(Attention):
         #     self._k_scale,
         #     self._v_scale,
         # )
-        # torch_npu.npu_scatter_nd_update_(self_kv_cache.view(-1, self_kv_cache.shape[-1]), sink_kv_slot_mapping, self.impl.sink_key.squeeze(dim=1))
-        # torch_npu.npu_scatter_nd_update_(self_kv_cache.view(-1, self_kv_cache.shape[-1]), sink_kv_slot_mapping, self.impl.sink_value.squeeze(dim=1))
+        # torch_npu.npu_scatter_nd_update_(self_k_cache.view(-1, self_k_cache.shape[-1]), sink_kv_slot_mapping, self.impl.sink_key.squeeze(dim=1))
+        # torch_npu.npu_scatter_nd_update_(self_v_cache.view(-1, self_v_cache.shape[-1]), sink_kv_slot_mapping, self.impl.sink_value.squeeze(dim=1))
         self.sink_populated = True
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
