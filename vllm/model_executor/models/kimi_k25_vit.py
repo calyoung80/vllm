@@ -35,6 +35,9 @@ from vllm.model_executor.models.vision import (
 )
 from vllm.transformers_utils.configs.kimi_k25 import KimiK25VisionConfig
 
+from vllm.model_executor.models.compare_tensor_sample import step3p5_compare_log
+__STEP3P5_COMPARE_ATTN_DETAIL = 0
+
 logger = init_logger(__name__)
 
 
@@ -59,11 +62,12 @@ def get_rope_shape_decorate(func):
 
 
 @get_rope_shape_decorate
-@torch.compile(dynamic=True)
+# @torch.compile(dynamic=True)
 def get_rope_shape(org, interpolation_mode, shape):
+    assert org.device == torch.device("cpu")
     return (
         F.interpolate(
-            org.permute((2, 0, 1)).unsqueeze(0),
+            org.permute((2, 0, 1)).unsqueeze(0) , #.contiguous()
             size=shape,
             mode=interpolation_mode,
         )
@@ -140,6 +144,8 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
         self.dim = dim
         self.interpolation_mode = interpolation_mode
         self.weight = nn.Parameter(torch.empty(height, width, dim))
+        # self.weight.dtype: torch.bfloat16
+        # self.weight = nn.Parameter(torch.empty(height, width, dim, device= torch.device("cpu")))
         self.register_buffer(
             "time_weight",
             torch.from_numpy(get_1d_sincos_pos_embed(self.dim, self.num_frames))
@@ -155,27 +161,55 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
 
     def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
         pos_embs = []
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("2Dembed.divided_fixed.forward.in.x",x)
+            step3p5_compare_log("2Dembed.divided_fixed.forward.in.grid_thws",grid_thws)
+
         for t, h, w in grid_thws.tolist():
+            # grid_thws.tolist(): [[1,7,138]]
+            # grid_thws.t:1, h:78, w:138
+            # self.weight.device: npu:2
+            # self.weight.shape: torch.size([64, 63, 1152])
+            if str(x.device) == "npu:2":
+                logger.warnning(f"======= grid_thws.tolist(): {grid_thws.tolist()} ======= ")
+                logger.warnning(f"======= grid_thws.t:{t},h:{h},w:{w} ======= ")
+                logger.warnning(f"======= self.weight.device: {self.weight.device} ======= ")
+                logger.warnning(f"======= self.weight.shape: {self.weight.shape} ======= ")
+            x_device = x.device
+            x_dtype = x.dtype
+
             assert t <= self.num_frames, f"t:{t} > self.num_frames:{self.num_frames}"
             if (h, w) == self.weight.shape[:-1]:
                 pos_emb_2d = self.weight.flatten(end_dim=1)
             else:
+                weight_fp32 = self.weight.to(dtype=torch.float32)
+                weight_cpu = weight_fp32.to("cpu")
+                
                 pos_emb_2d = get_rope_shape(
                     self.weight,
                     interpolation_mode=self.interpolation_mode,
                     shape=(h, w),
                 )
+                pos_emb_2d = pos_emb_2d.to(x_device, dtype = x_dtype)
+
+                # pos_emb_2d.shape: torch.size([10764, 1152])
+                # if str(x.device) == "npu:2":
+                #    logger.warn(f"======= pos_emb_2d.shape: {pos_emb_2d.shape} ======== ")
+            if __STEP3P5_COMPARE_ATTN_DETAIL:
+                step3p5_compare_log("2Dembed.divided_fixed.forward.pos_emb_2d",pos_emb_2d)
 
             if t == 1:
                 pos_emb_3d = pos_emb_2d
             else:
                 pos_emb_3d = (
-                    pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[0:t]
+                    pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[0:t].to(x_device, dtype =x_dtype)
                 )
 
             pos_embs.append(pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1]))
 
         out = x + torch.cat(pos_embs)
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("2Dembed,divided_fixed.forward.out",out)
         return out
 
 
@@ -218,9 +252,18 @@ class MoonVision3dPatchEmbed(nn.Module):
             raise NotImplementedError(f"Not support pos_emb_type: {pos_emb_type}")
 
     def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("embed.forward.x", x)
+
         x = self.proj(x).view(x.size(0), -1)
+
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("embed.forward.proj.x", x)
         # apply positional embedding
         x = self.pos_emb(x, grid_thws)
+
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("embed.forward.out.x", x)
         return x
 
 
@@ -308,6 +351,8 @@ class MLP2(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
+        self.layer_idx = int(prefix.split("blocks.")[1].split(".")[0])
+
         assert len(dims) == 3
         self.use_data_parallel = use_data_parallel
         self.fc0 = ColumnParallelLinear(
@@ -328,8 +373,17 @@ class MLP2(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x, _ = self.fc0(x)
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("mlp.forward.fc0.x", x, layer_idx = self.layer_idx)
+
         x = self.activation(x)
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("mlp.forward.activation.x", x, layer_idx = self.layer_idx)
+
         x, _ = self.fc1(x)
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("mlp.forward.fc1.x", x, layer_idx = self.layer_idx)
+
         return x
 
 
@@ -348,6 +402,8 @@ class MoonViTEncoderLayer(nn.Module):
     ):
         super().__init__()
         self.use_data_parallel = is_vit_use_data_parallel()
+        self.layer_idx = int(prefix.split("blocks.")[1].split(".")[0])
+
 
         self.num_heads = num_heads
         self.hidden_dim = hidden_dim
@@ -436,19 +492,36 @@ class MoonViTEncoderLayer(nn.Module):
         cu_seqlens: torch.Tensor,
         rope_freqs_cis: torch.Tensor | None = None,
     ):
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("vit.encoder.forward.in.hidden_states", hidden_states, layer_idx = self.layer_idx)
+            step3p5_compare_log("vit.encoder.forward.in.cu_seqlens", cu_seqlens, layer_idx = self.layer_idx)
+            step3p5_compare_log("vit.encoder.forward.in.rope_freqs_cis", rope_freqs_cis, layer_idx = self.layer_idx)
+
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("vit.encoder.foward.norm0.hidden_states", hidden_states, layer_idx = self.layer_idx)
 
         hidden_states = self.attention_qkvpacked(
             hidden_states, cu_seqlens, rope_freqs_cis
         )
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("vit.encoder.foward.attention.qkvpacked.hidden_states", hidden_states, layer_idx = self.layer_idx)
+
         hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states = self.norm1(hidden_states)
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("vit.encoder.foward.norm1.hidden_states", hidden_states, layer_idx = self.layer_idx)
+        
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("vit.encoder.foward.mlp.hidden_states", hidden_states, layer_idx = self.layer_idx)
 
+        hidden_states = residual + hidden_states
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("vit.encoder.foward.out.hidden_states", hidden_states, layer_idx = self.layer_idx)
         return hidden_states
 
 
@@ -465,6 +538,7 @@ class MoonViT3dEncoder(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.layer_idx = int(prefix.split("blocks.")[1].split(".")[0]) if len(prefix.split("blocks."))> 1 else -1
         assert video_attn_type == "spatial_temporal", (
             f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
         )
@@ -488,6 +562,9 @@ class MoonViT3dEncoder(nn.Module):
         hidden_states: torch.Tensor,
         grid_thws: torch.Tensor,
     ) -> torch.Tensor:
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("3d.encoder.forward.in.hidden_states", hidden_states, layer_idx = self.layer_idx)
+
         rope_freqs_cis = self.rope_2d.get_freqs_cis(
             grid_thws=grid_thws, device=hidden_states.device
         )
@@ -505,8 +582,13 @@ class MoonViT3dEncoder(nn.Module):
             hidden_states = block(
                 hidden_states, cu_seqlens, rope_freqs_cis=rope_freqs_cis
             )
+            if __STEP3P5_COMPARE_ATTN_DETAIL:
+                step3p5_compare_log("3d.encoder.forward.block.hidden_states", hidden_states, layer_idx = self.layer_idx)
+        ### block_layer_num:27
 
         hidden_states = self.final_layernorm(hidden_states)
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("3d.encoder.forward.layernorm.hidden_states", hidden_states, layer_idx = self.layer_idx)
 
         return hidden_states
 
@@ -588,7 +670,13 @@ class MoonViT3dPretrainedModel(nn.Module):
             torch.Tensor: The output tokens.
         """
         hidden_states = self.patch_embed(pixel_values, grid_thws)
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("3d.pretrain.forward.patch_embed.hidden_states", hidden_states, layer_idx = self.layer_idx)
+
         hidden_states = self.encoder(hidden_states, grid_thws)
+        if __STEP3P5_COMPARE_ATTN_DETAIL:
+            step3p5_compare_log("3d.pretrain.forward.encoder.hidden_states", hidden_states, layer_idx = self.layer_idx)
+        
         if (
             self.merge_type == "sd2_tpool"
         ):  # spatial downsampling 2x with temporal pooling all

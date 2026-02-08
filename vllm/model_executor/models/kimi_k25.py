@@ -320,7 +320,8 @@ class KimiK25ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP)
             model_config.multimodal_config.mm_encoder_tp_mode == "data"
         )
         self.hidden_size = config.text_config.hidden_size
-        self.device = torch.cuda.current_device()
+        #self.device = torch.cuda.current_device()
+        self.device = torch.npu.current_device()
         # Build vision tower directly with KimiK25VisionConfig
         self.vision_tower = MoonViT3dPretrainedModel(
             config.vision_config,
